@@ -5,6 +5,8 @@
 #' @importFrom magrittr mod "%>%"
 NULL
 
+library(dplyr)
+
 
 # CRAN sometimes issues spurious warnings about undefined variables
 utils::globalVariables( c( ".", "%>%", "x", "y", "c", "value" ) )
