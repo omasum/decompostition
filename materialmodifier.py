@@ -2,6 +2,7 @@ import numpy as np
 from guided_filter_pytorch.guided_filter import GuidedFilter
 import matplotlib.pyplot as plt
 import torch
+import cv2
 import torchvision.utils as tv_utils
 import kornia
 import os
@@ -26,23 +27,6 @@ def rgb2lab(img):
     lab_batch = kornia.color.rgb_to_lab(img)
     
     return lab_batch
-
-def lab_to_rgb(lab_batch):
-    """
-    Convert a batch of Lab images to RGB.
-
-    Args:
-        lab_batch (torch.Tensor): A tensor of shape (batch_size, 3, height, width) representing
-            a batch of Lab images. The L channel is assumed to be in the range of \([0, 100]\). a and b channels are in the range of \([-128, 127]\)
-
-    Returns:
-        A tensor of shape (batch_size, C, height, width) representing the converted RGB images. The output RGB image are in the range of \([0, 1]\).
-    """
-    
-    # convert lab to rgb
-    rgb = kornia.color.lab_to_rgb(lab_batch)
-    
-    return rgb
 
 
 def guided_filter(p, radius, epsilon=0.1, I=None):
@@ -257,37 +241,46 @@ def Lab2sRGB(img):
     rgb_batch = kornia.color.lab_to_rgb(img)
     return rgb_batch
 
-def gf_reconstruct(dec, scales, ind, include_residual=True, logspace=True):
+def gf_reconstruct(dec, maps, scales, ind, include_residual=True, logspace=True):
 
     '''
         Reconstruct the original image from decomposed data
 
         Args:
-            dec decomposed data
-            scales which spatial scales to use for reconstruction
-            ind a numeric vector
-            include_residual either TRUE (default) or FALSE
-            logspace If TRUE (default), image processing is done in the log space. If FALSE, computation is performed without log transformation.
+            dec: decomposed data
+            scales: which spatial scales to use for reconstruction, BS or initial deconposition(None)
+            ind: a numeric vector
+            include_residual: either TRUE (default) or FALSE
+            logspace: If TRUE (default), image processing is done in the log space. If FALSE, computation is performed without log transformation.
 
         Return:
             rgb images: tensor[b,c,h,w], range (0,1)
     '''
-    if scales is None:
-        scales = range(1, dec['depth'] + 1)
-    if ind is None:
-        ind = range(1, 5)
+
     index = ["highamp_posi", "highamp_nega", "lowamp_posi", "lowamp_nega"]
     
     recon = torch.zeros(dec['size'])
-    for i in scales:
-        if isinstance(dec['L'][i - 1], torch.Tensor):
-            # scale-only decomposition
-            recon = recon + dec['L'][i - 1]
-        else:
-            # scale and parts decomposition
-            for j in ind:
-                idx = index[j-1]
-                recon = recon + dec['L'][i - 1][idx]
+
+    
+    if scales == "BS":
+        for key, value in maps.items():
+            recon = recon + value
+
+    if ind is None:
+        ind = range(1, 5)
+
+    if scales is None:
+        scale = range(1, dec['depth'] + 1)
+        for i in scale:
+            if isinstance(dec['L'][i - 1], torch.Tensor):
+                # scale-only decomposition
+                recon = recon + dec['L'][i - 1]
+            else:
+                # scale and parts decomposition
+                for j in ind:
+                    idx = index[j-1]
+                    recon = recon + dec['L'][i - 1][idx]
+
     if include_residual:
         recon = recon + dec['L'][dec['depth']]['residual']
     if logspace:
@@ -299,6 +292,7 @@ def gf_reconstruct(dec, scales, ind, include_residual=True, logspace=True):
         recon = Lab2sRGB(recon)
 
     return recon
+
 
 def get_BS_energy(im, mask=None, logspace=True):
 
@@ -329,7 +323,7 @@ def get_BS_energy(im, mask=None, logspace=True):
         "LLP": dec["L"][dec["depth"]-1]["lowamp_posi"],
         "LLN": dec["L"][dec["depth"]-1]["lowamp_nega"],
     }
-    for i in range(1, dec["depth"]):
+    for i in range(1, dec["depth"]-1):
         if i <= dec["depth"] // 2:
             maps["HHP"] += dec["L"][i]["highamp_posi"]
             maps["HHN"] += dec["L"][i]["highamp_nega"]
@@ -342,16 +336,52 @@ def get_BS_energy(im, mask=None, logspace=True):
             maps["LLN"] += dec["L"][i]["lowamp_nega"]
     return maps, dec
 
-def Show_subbands(img):
+def LEdit(img, maps, weight):
+    '''edit decomposition bands in maps with weights
+
+    Args:
+        img: (tensor.Float[batchsize, 3, h, w]) original image
+        maps: (dictionary value: tensor.Float[batchsize, 1, h, w]) maps after BS decomposition
+        weight: (tensor.Float[batchsize, 8])
+
+    Returns:
+        new_maps: (dictionary value: tensor.Float[batchsize, 1, h, w])
+    '''
+    h,w = img.shape[2:4]
+    weights = weight.t().unsqueeze(2).unsqueeze(3).unsqueeze(4).expand(-1, -1, 1, h, w)
+    i = 0
+    new_maps = {}
+    for key, value in maps.items():
+        new_maps[key] = value*weights[i]
+        i = i+1 # i==8 stop
+    return new_maps
+
+def Show_subbands(img, Logspace=False):
     '''
         show decomposion of img
         Args:
             img: torch.Tensor(B, C, H, W)
     '''
 
-    maps, dec = get_BS_energy(img, logspace=False)
-    rebuild = gf_reconstruct(dec, scales=None, ind=None, logspace=False)
+    maps, dec = get_BS_energy(img, logspace=Logspace)
+
+    rebuild = gf_reconstruct(dec, maps, scales=None, ind=None, logspace=Logspace)
+    rebuild_map = gf_reconstruct(dec, maps, scales="BS", ind=None, logspace=Logspace)
+    weight0 = torch.zeros(img.shape[0], 8)
+    weight1 = torch.ones(img.shape[0], 8)
+    new_map0 = LEdit(img, maps, weight0)
+    new_map1 = LEdit(img, maps, weight1)
+    rebuild_map0 = gf_reconstruct(dec, new_map0, scales="BS", ind=None, logspace=Logspace)
+    rebuild_map1 = gf_reconstruct(dec, new_map1, scales="BS", ind=None, logspace=Logspace)
+    # for i in range(0, rebuild.shape[0]):
+    #     img_rebuild = rebuild[i] # [C, H, W]
+    #     img_rebuild = torch.transpose(img_rebuild, (1,2,0))
+    #     cv2.imwrite(os.path.join(r'decompose\results', str(i+1)+ "_rebuild.png"), img_rebuild)
+
     tv_utils.save_image(rebuild, os.path.join(r'decompose\results', 'rebuild_image.png'), normalize=True)
+    tv_utils.save_image(rebuild_map, os.path.join(r'decompose\results', 'rebuild_map.png'), normalize=True)
+    tv_utils.save_image(rebuild_map0, os.path.join(r'decompose\results', 'rebuild_map0.png'), normalize=True)
+    tv_utils.save_image(rebuild_map1, os.path.join(r'decompose\results', 'rebuild_map1.png'), normalize=True)
     L_channel = dec['L_origin']
     a_channel = dec["a"] # torch.Tensor(B, 1, H, W)
     b_channel = dec["b"] # torch.Tensor(B, 1, H, W)
@@ -359,6 +389,10 @@ def Show_subbands(img):
 
     tc = torch.cat([L_channel, a_channel, b_channel], dim = 1)
     rgb_img = Lab2sRGB(tc) # torch.Tensor(B, 3, H, W)
+    # for i in range(0, rgb_img.shape[0]):
+    #     img_original = rgb_img[i]
+    #     cv2.imwrite(os.path.join(r'decompose\results', str(i+1)+ "_original.png"), img_original)
+
     tv_utils.save_image(rgb_img, os.path.join(r'decompose\results', 'original_image.png'), normalize=True)
 
     contain = []
@@ -366,7 +400,7 @@ def Show_subbands(img):
     for item in maps.items(): # key: string, value: torch.Tensor(B, 1, H, W)
         L = item[1] # torch.Tensor(B, 1, H, W)
         # L = torch.exp(L) - log_epsilon
-        L_show = L.repeat(1,3,1,1) # torch.Tensor(B, 3, H, W)
+        L_show = L.repeat(1,3,1,1) # torch.Tensor(B, 3, H, W)                                                                                                                                                       
         # rgb_img = Lab2sRGB(L_show)
         tag = item[0] #string
 
@@ -379,7 +413,7 @@ def Show_subbands(img):
             tv_utils.save_image(img_bands, os.path.join(r'decompose\results', str(i+1)+ "_" + tag + '.png'), normalize=True)
 
 def test():
-    batchsize = 5
+    batchsize = 1
 
     #load dataset
     path = r"decompose\dataset"
@@ -389,6 +423,6 @@ def test():
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=batchsize, shuffle=False)
 
     for batch in dataloader:
-        Show_subbands(batch[0])
+        Show_subbands(batch[0], Logspace=True)
 
 test()
